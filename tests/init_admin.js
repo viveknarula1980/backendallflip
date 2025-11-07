@@ -14,9 +14,9 @@ const {
 
 const RPC_URL = "https://api.devnet.solana.com";
 const WALLET_PATH = path.join(process.env.HOME, ".config/solana/id.json");
-const PROGRAM_ID = new PublicKey("8XdQXT8TiguCysUPoAzXV611mhdgYKAN6G331CXC81GP"); // your deployed id
-const ADMIN_PUBKEY_BASE58 = "BLBYKR6jyK7DB9aXUecurbPMiJ8epHMVWPsbkiAVyER"; // PUBLIC key from gen_admin_keys.js
-const LOCAL_IDL_PATH = path.join(__dirname, "../target/idl/anchor_dice.json"); // your IDL file
+const PROGRAM_ID = new PublicKey("5vgLU8GyehUkziMaKHCtyPu6YZgo11wct8rTHLdz4z1"); // ✅ your deployed allgame program
+const ADMIN_PUBKEY_BASE58 = "EWaMqbKeyv2V2WheLUDuuFs7DqTqhARVd34JvkZPRu7z"; // ✅ matches .env ADMIN_PUBKEY_BASE58
+const LOCAL_IDL_PATH = path.join(__dirname, "../target/idl/casino.json"); // ✅ use your actual IDL file name
 
 function anchorDiscriminator(ixName) {
   const preimage = Buffer.from(`global:${ixName}`);

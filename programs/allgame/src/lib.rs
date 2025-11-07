@@ -11,13 +11,22 @@ use anchor_lang::solana_program::{
     },
 };
 
-declare_id!("5vgLU8GyehUkziMaKHCtyPu6YZgo11wct8rTHLdz4z1"); // ← REPLACE after deploy
+declare_id!("5vgLU8GyehUkziMaKHCtyPu6YZgo11wct8rTHLdz4z1"); // ← your deployed ID
 
 // ---- constants ----
-const MAX_PAYOUT_LAMPORTS: u64 = 50_000_000_000; // 0.05 SOL (tune)
-const MIN_BET_LAMPORTS: u64  = 50_000;           // 0.00005 SOL
-const MAX_BET_LAMPORTS: u64  = 5_000_000_000;    // 5 SOL
-const FEE_REIMBURSE_LAMPORTS: u64 = 1_400_000;   // user_vault → server fee payer (set 0 to disable)
+const MAX_PAYOUT_LAMPORTS: u64 = 5_000_000_000_000; // 5 SOL max payout
+const MIN_BET_LAMPORTS: u64  = 50_000;              // 0.00005 SOL
+const MAX_BET_LAMPORTS: u64  = 5_000_000_000;       // 5 SOL
+const FEE_REIMBURSE_LAMPORTS: u64 = 1_400_000;      // unchanged
+// user_vault → server fee payer (set 0 to disable)
+
+// Hard-coded admin pubkey (Base58: 5jHZt8Jc6rahAdVVuwbBYRaNJ8XfN6g89jKP5jpvJq3)
+const ADMIN_PUBKEY_BYTES: [u8; 32] = [
+    1, 54, 34, 193, 9, 155, 8, 216,
+    107, 220, 252, 98, 107, 138, 215, 172,
+    230, 182, 102, 126, 251, 3, 32, 49,
+    224, 149, 75, 152, 12, 204, 228, 190,
+];
 
 #[error_code]
 pub enum CasinoErr {
@@ -99,7 +108,7 @@ pub struct PendingPlinko {
     pub unit_amount: u64, // per ball
     pub balls: u16,
     pub rows: u8,
-    pub difficulty: u8,   // 0 easy, 1 med, 2 hard
+    pub difficulty: u8,   // 0..5 (easy→extreme)
     pub nonce: u64,
     pub expiry_unix: i64,
     pub settled: bool,
@@ -135,6 +144,13 @@ impl PendingSlots { pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1; }
 #[event] pub struct SlotsLocked    { pub player: Pubkey, pub amount: u64, pub nonce: u64 }
 #[event] pub struct SlotsResolved  { pub player: Pubkey, pub payout: u64, pub checksum: u8, pub nonce: u64 }
 
+// NEW: admin house vault withdraw event
+#[event]
+pub struct HouseWithdrawn {
+    pub to: Pubkey,
+    pub amount: u64,
+}
+
 // ---- utils ----
 fn safe_move_lamports(from: &AccountInfo<'_>, to: &AccountInfo<'_>, amount: u64) -> Result<()> {
     require!(amount > 0, CasinoErr::BadParams);
@@ -167,6 +183,17 @@ pub struct InitAdmin<'info> {
     #[account(init, payer=authority, space=8+32, seeds=[b"admin"], bump)]
     pub admin_config: Account<'info, AdminConfig>,
     pub system_program: Program<'info, System>,
+}
+
+// NEW: update an existing admin_config without re-init
+#[derive(Accounts)]
+pub struct UpdateAdmin<'info> {
+    /// Hard-coded admin must sign to rotate admin_config
+    #[account(mut, signer)]
+    pub authority: SystemAccount<'info>,
+
+    #[account(mut, seeds=[b"admin"], bump)]
+    pub admin_config: Account<'info, AdminConfig>,
 }
 
 #[derive(Accounts)]
@@ -202,6 +229,24 @@ pub struct WithdrawFromVault<'info> {
     pub system_program: Program<'info, System>,
 }
 
+// NEW: house vault withdraw context (admin → any destination)
+#[derive(Accounts)]
+pub struct HouseWithdraw<'info> {
+    /// Admin signer (must match hard-coded ADMIN_PUBKEY_BYTES)
+    #[account(mut, signer)]
+    pub admin: SystemAccount<'info>,
+
+    /// House vault PDA
+    #[account(mut, seeds = [b"vault"], bump)]
+    pub house_vault: SystemAccount<'info>,
+
+    /// Where funds go – can be ANY wallet
+    #[account(mut)]
+    pub destination: SystemAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // ---- args ----
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct ActivateArgs { pub initial_deposit: u64 }
@@ -209,6 +254,12 @@ pub struct ActivateArgs { pub initial_deposit: u64 }
 pub struct DepositArgs  { pub amount: u64 }
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct WithdrawArgs { pub amount: u64 }
+
+// NEW: args for admin house vault withdraw
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct HouseWithdrawArgs {
+    pub amount: u64,
+}
 
 // dice
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -310,7 +361,17 @@ pub mod casino {
     use super::*;
 
     pub fn init_admin(ctx: Context<InitAdmin>, admin_pubkey: [u8; 32]) -> Result<()> {
-        ctx.accounts.admin_config.admin_pubkey = admin_pubkey; Ok(())
+        ctx.accounts.admin_config.admin_pubkey = admin_pubkey;
+        Ok(())
+    }
+
+    // NEW: update existing AdminConfig without re-init
+    pub fn update_admin(ctx: Context<UpdateAdmin>, new_admin_pubkey: [u8; 32]) -> Result<()> {
+        let hardcoded = Pubkey::new_from_array(ADMIN_PUBKEY_BYTES);
+        require!(ctx.accounts.authority.key() == hardcoded, CasinoErr::BadParams);
+
+        ctx.accounts.admin_config.admin_pubkey = new_admin_pubkey;
+        Ok(())
     }
 
     pub fn init_house_vault(ctx: Context<InitHouseVault>) -> Result<()> {
@@ -340,24 +401,38 @@ pub mod casino {
         uv.owner = ctx.accounts.player.key();
         uv.bump  = ctx.bumps.user_vault;
         if args.initial_deposit > 0 {
-            let ix = system_instruction::transfer(&ctx.accounts.player.key(), &ctx.accounts.user_vault.key(), args.initial_deposit);
-            invoke(&ix, &[
-                ctx.accounts.player.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.player.key(),
+                &ctx.accounts.user_vault.key(),
+                args.initial_deposit,
+            );
+            invoke(
+                &ix,
+                &[
+                    ctx.accounts.player.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
         }
         Ok(())
     }
 
     pub fn deposit_to_vault(ctx: Context<DepositToVault>, args: DepositArgs) -> Result<()> {
         require!(args.amount > 0, CasinoErr::BadParams);
-        let ix = system_instruction::transfer(&ctx.accounts.player.key(), &ctx.accounts.user_vault.key(), args.amount);
-        invoke(&ix, &[
-            ctx.accounts.player.to_account_info(),
-            ctx.accounts.user_vault.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-        ])?;
+        let ix = system_instruction::transfer(
+            &ctx.accounts.player.key(),
+            &ctx.accounts.user_vault.key(),
+            args.amount,
+        );
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.player.to_account_info(),
+                ctx.accounts.user_vault.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -366,6 +441,40 @@ pub mod casino {
         let from = ctx.accounts.user_vault.to_account_info();
         let to   = ctx.accounts.player.to_account_info();
         safe_move_lamports(&from, &to, args.amount)
+    }
+
+    // ✅ secure admin house vault withdraw (to ANY destination) using invoke_signed
+    pub fn house_withdraw(ctx: Context<HouseWithdraw>, args: HouseWithdrawArgs) -> Result<()> {
+        require!(args.amount > 0, CasinoErr::BadParams);
+
+        // Only allow our fixed admin key to withdraw from the house vault
+        let expected_admin = Pubkey::new_from_array(ADMIN_PUBKEY_BYTES);
+        require!(ctx.accounts.admin.key() == expected_admin, CasinoErr::BadParams);
+
+        // Use SystemProgram.transfer via CPI + PDA signature
+        let bump_v = ctx.bumps.house_vault;
+        let ix = system_instruction::transfer(
+            &ctx.accounts.house_vault.key(),
+            &ctx.accounts.destination.key(),
+            args.amount,
+        );
+
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.house_vault.to_account_info(),
+                ctx.accounts.destination.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[&[b"vault", &[bump_v]]],
+        )?;
+
+        emit!(HouseWithdrawn {
+            to: ctx.accounts.destination.key(),
+            amount: args.amount,
+        });
+
+        Ok(())
     }
 
     // ---- dice ----
@@ -404,7 +513,10 @@ pub mod casino {
         require!(args.bet_amount >= MIN_BET_LAMPORTS && args.bet_amount <= MAX_BET_LAMPORTS, CasinoErr::BadParams);
         require!(args.target >= 2 && args.target <= 98, CasinoErr::BadParams);
         require!(args.bet_type <= 1, CasinoErr::BadParams);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
         require!(ctx.accounts.user_vault.owner == ctx.accounts.player.key(), CasinoErr::VaultMismatch);
 
         let uv_bal = **ctx.accounts.user_vault.to_account_info().lamports.borrow();
@@ -429,7 +541,13 @@ pub mod casino {
         p.expiry_unix = args.expiry_unix;
         p.settled = false;
 
-        emit!(DiceLocked { player: p.player, amount: p.amount, bet_type: p.bet_type, target: p.target, nonce: p.nonce });
+        emit!(DiceLocked {
+            player: p.player,
+            amount: p.amount,
+            bet_type: p.bet_type,
+            target: p.target,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -439,10 +557,16 @@ pub mod casino {
 
         let clock = Clock::get()?;
         require!(clock.unix_timestamp <= p.expiry_unix, CasinoErr::Expired);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
 
         require!(args.roll >= 1 && args.roll <= 100, CasinoErr::BadParams);
-        let win = match p.bet_type { 0 => args.roll < p.target, _ => args.roll > p.target };
+        let win = match p.bet_type {
+            0 => args.roll < p.target,
+            _ => args.roll > p.target,
+        };
         if win {
             require!(args.payout > 0 && args.payout <= MAX_PAYOUT_LAMPORTS, CasinoErr::BadPayout);
         } else {
@@ -451,16 +575,30 @@ pub mod casino {
 
         if win && args.payout > 0 {
             let bump_v = ctx.bumps.house_vault;
-            let ix = system_instruction::transfer(&ctx.accounts.house_vault.key(), &ctx.accounts.user_vault.key(), args.payout);
-            invoke_signed(&ix, &[
-                ctx.accounts.house_vault.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ], &[&[b"vault", &[bump_v]]])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.house_vault.key(),
+                &ctx.accounts.user_vault.key(),
+                args.payout,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.house_vault.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[&[b"vault", &[bump_v]]],
+            )?;
         }
 
         p.settled = true;
-        emit!(DiceResolved { player: p.player, win, roll: args.roll, payout: args.payout, nonce: p.nonce });
+        emit!(DiceResolved {
+            player: p.player,
+            win,
+            roll: args.roll,
+            payout: args.payout,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -503,7 +641,10 @@ pub mod casino {
         let total = (args.rows as u16) * (args.cols as u16);
         require!(args.mines >= 1 && (args.mines as u16) < total, CasinoErr::BadParams);
 
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
         require!(ctx.accounts.user_vault.owner == ctx.accounts.player.key(), CasinoErr::VaultMismatch);
 
         let uv_bal = **ctx.accounts.user_vault.to_account_info().lamports.borrow();
@@ -529,7 +670,14 @@ pub mod casino {
         p.expiry_unix = args.expiry_unix;
         p.settled = false;
 
-        emit!(MinesLocked { player: p.player, amount: p.amount, rows: p.rows, cols: p.cols, mines: p.mines, nonce: p.nonce });
+        emit!(MinesLocked {
+            player: p.player,
+            amount: p.amount,
+            rows: p.rows,
+            cols: p.cols,
+            mines: p.mines,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -539,7 +687,10 @@ pub mod casino {
 
         let clock = Clock::get()?;
         require!(clock.unix_timestamp <= p.expiry_unix, CasinoErr::Expired);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
 
         let expected = ((p.nonce % 251) + 1) as u8;
         require!(args.checksum == expected, CasinoErr::BadParams);
@@ -547,16 +698,29 @@ pub mod casino {
 
         if args.payout > 0 {
             let bump_v = ctx.bumps.house_vault;
-            let ix = system_instruction::transfer(&ctx.accounts.house_vault.key(), &ctx.accounts.user_vault.key(), args.payout);
-            invoke_signed(&ix, &[
-                ctx.accounts.house_vault.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ], &[&[b"vault", &[bump_v]]])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.house_vault.key(),
+                &ctx.accounts.user_vault.key(),
+                args.payout,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.house_vault.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[&[b"vault", &[bump_v]]],
+            )?;
         }
 
         p.settled = true;
-        emit!(MinesResolved { player: p.player, payout: args.payout, checksum: args.checksum, nonce: p.nonce });
+        emit!(MinesResolved {
+            player: p.player,
+            payout: args.payout,
+            checksum: args.checksum,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -595,7 +759,10 @@ pub mod casino {
     pub fn flip_lock(ctx: Context<FlipLock>, args: FlipLockArgs) -> Result<()> {
         require!(args.bet_amount >= MIN_BET_LAMPORTS && args.bet_amount <= MAX_BET_LAMPORTS, CasinoErr::BadParams);
         require!(args.side <= 1, CasinoErr::BadParams);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
         require!(ctx.accounts.user_vault.owner == ctx.accounts.player.key(), CasinoErr::VaultMismatch);
 
         let uv_bal = **ctx.accounts.user_vault.to_account_info().lamports.borrow();
@@ -612,9 +779,18 @@ pub mod casino {
         }
 
         let p = &mut ctx.accounts.pending;
-        p.player = ctx.accounts.player.key(); p.amount = args.bet_amount; p.side = args.side;
-        p.nonce = args.nonce; p.expiry_unix = args.expiry_unix; p.settled = false;
-        emit!(FlipLocked { player: p.player, amount: p.amount, side: p.side, nonce: p.nonce });
+        p.player = ctx.accounts.player.key();
+        p.amount = args.bet_amount;
+        p.side = args.side;
+        p.nonce = args.nonce;
+        p.expiry_unix = args.expiry_unix;
+        p.settled = false;
+        emit!(FlipLocked {
+            player: p.player,
+            amount: p.amount,
+            side: p.side,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -624,24 +800,43 @@ pub mod casino {
 
         let clock = Clock::get()?;
         require!(clock.unix_timestamp <= p.expiry_unix, CasinoErr::Expired);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
 
         require!(args.winner_side <= 1, CasinoErr::BadParams);
         let win = args.winner_side == p.side;
-        if win { require!(args.payout > 0 && args.payout <= MAX_PAYOUT_LAMPORTS, CasinoErr::BadPayout); }
-        else   { require!(args.payout == 0, CasinoErr::BadPayout); }
+        if win {
+            require!(args.payout > 0 && args.payout <= MAX_PAYOUT_LAMPORTS, CasinoErr::BadPayout);
+        } else {
+            require!(args.payout == 0, CasinoErr::BadPayout);
+        }
 
         if win && args.payout > 0 {
             let bump_v = ctx.bumps.house_vault;
-            let ix = system_instruction::transfer(&ctx.accounts.house_vault.key(), &ctx.accounts.user_vault.key(), args.payout);
-            invoke_signed(&ix, &[
-                ctx.accounts.house_vault.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ], &[&[b"vault", &[bump_v]]])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.house_vault.key(),
+                &ctx.accounts.user_vault.key(),
+                args.payout,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.house_vault.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[&[b"vault", &[bump_v]]],
+            )?;
         }
         p.settled = true;
-        emit!(FlipResolved { player: p.player, winner_side: args.winner_side, payout: args.payout, nonce: p.nonce });
+        emit!(FlipResolved {
+            player: p.player,
+            winner_side: args.winner_side,
+            payout: args.payout,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -679,7 +874,10 @@ pub mod casino {
 
     pub fn crash_lock(ctx: Context<CrashLock>, args: CrashLockArgs) -> Result<()> {
         require!(args.bet_amount >= MIN_BET_LAMPORTS && args.bet_amount <= MAX_BET_LAMPORTS, CasinoErr::BadParams);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
         require!(ctx.accounts.user_vault.owner == ctx.accounts.player.key(), CasinoErr::VaultMismatch);
 
         let uv_bal = **ctx.accounts.user_vault.to_account_info().lamports.borrow();
@@ -696,8 +894,16 @@ pub mod casino {
         }
 
         let p = &mut ctx.accounts.pending;
-        p.player = ctx.accounts.player.key(); p.amount = args.bet_amount; p.nonce = args.nonce; p.expiry_unix = args.expiry_unix; p.settled = false;
-        emit!(CrashLocked { player: p.player, amount: p.amount, nonce: p.nonce });
+        p.player = ctx.accounts.player.key();
+        p.amount = args.bet_amount;
+        p.nonce = args.nonce;
+        p.expiry_unix = args.expiry_unix;
+        p.settled = false;
+        emit!(CrashLocked {
+            player: p.player,
+            amount: p.amount,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -707,21 +913,37 @@ pub mod casino {
 
         let clock = Clock::get()?;
         require!(clock.unix_timestamp <= p.expiry_unix, CasinoErr::Expired);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
 
         require!(args.multiplier_bps >= 10000, CasinoErr::BadParams); // >=1x
         require!(args.payout <= MAX_PAYOUT_LAMPORTS, CasinoErr::BadPayout);
         if args.payout > 0 {
             let bump_v = ctx.bumps.house_vault;
-            let ix = system_instruction::transfer(&ctx.accounts.house_vault.key(), &ctx.accounts.user_vault.key(), args.payout);
-            invoke_signed(&ix, &[
-                ctx.accounts.house_vault.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ], &[&[b"vault", &[bump_v]]])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.house_vault.key(),
+                &ctx.accounts.user_vault.key(),
+                args.payout,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.house_vault.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[&[b"vault", &[bump_v]]],
+            )?;
         }
         p.settled = true;
-        emit!(CrashResolved { player: p.player, multiplier_bps: args.multiplier_bps, payout: args.payout, nonce: p.nonce });
+        emit!(CrashResolved {
+            player: p.player,
+            multiplier_bps: args.multiplier_bps,
+            payout: args.payout,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -760,9 +982,12 @@ pub mod casino {
         require!(args.unit_amount >= MIN_BET_LAMPORTS && args.unit_amount <= MAX_BET_LAMPORTS, CasinoErr::BadParams);
         require!(args.balls >= 1, CasinoErr::BadParams);
         require!(args.rows >= 8 && args.rows <= 16, CasinoErr::BadParams);
-        require!(args.difficulty <= 2, CasinoErr::BadParams); // 0,1,2
+        require!(args.difficulty <= 5, CasinoErr::BadParams); // 0..5 (easy→extreme)
 
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
         require!(ctx.accounts.user_vault.owner == ctx.accounts.player.key(), CasinoErr::VaultMismatch);
 
         let total = (args.unit_amount as u128) * (args.balls as u128);
@@ -782,9 +1007,22 @@ pub mod casino {
         }
 
         let p = &mut ctx.accounts.pending;
-        p.player = ctx.accounts.player.key(); p.unit_amount = args.unit_amount; p.balls = args.balls; p.rows = args.rows; p.difficulty = args.difficulty;
-        p.nonce = args.nonce; p.expiry_unix = args.expiry_unix; p.settled = false;
-        emit!(PlinkoLocked { player: p.player, unit_amount: p.unit_amount, balls: p.balls, rows: p.rows, difficulty: p.difficulty, nonce: p.nonce });
+        p.player = ctx.accounts.player.key();
+        p.unit_amount = args.unit_amount;
+        p.balls = args.balls;
+        p.rows = args.rows;
+        p.difficulty = args.difficulty;
+        p.nonce = args.nonce;
+        p.expiry_unix = args.expiry_unix;
+        p.settled = false;
+        emit!(PlinkoLocked {
+            player: p.player,
+            unit_amount: p.unit_amount,
+            balls: p.balls,
+            rows: p.rows,
+            difficulty: p.difficulty,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -794,20 +1032,36 @@ pub mod casino {
 
         let clock = Clock::get()?;
         require!(clock.unix_timestamp <= p.expiry_unix, CasinoErr::Expired);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
 
         require!(args.total_payout <= MAX_PAYOUT_LAMPORTS, CasinoErr::BadPayout);
         if args.total_payout > 0 {
             let bump_v = ctx.bumps.house_vault;
-            let ix = system_instruction::transfer(&ctx.accounts.house_vault.key(), &ctx.accounts.user_vault.key(), args.total_payout);
-            invoke_signed(&ix, &[
-                ctx.accounts.house_vault.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ], &[&[b"vault", &[bump_v]]])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.house_vault.key(),
+                &ctx.accounts.user_vault.key(),
+                args.total_payout,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.house_vault.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[&[b"vault", &[bump_v]]],
+            )?;
         }
         p.settled = true;
-        emit!(PlinkoResolved { player: p.player, total_payout: args.total_payout, checksum: args.checksum, nonce: p.nonce });
+        emit!(PlinkoResolved {
+            player: p.player,
+            total_payout: args.total_payout,
+            checksum: args.checksum,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -845,7 +1099,10 @@ pub mod casino {
 
     pub fn slots_lock(ctx: Context<SlotsLock>, args: SlotsLockArgs) -> Result<()> {
         require!(args.bet_amount >= MIN_BET_LAMPORTS && args.bet_amount <= MAX_BET_LAMPORTS, CasinoErr::BadParams);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
         require!(ctx.accounts.user_vault.owner == ctx.accounts.player.key(), CasinoErr::VaultMismatch);
 
         let uv_bal = **ctx.accounts.user_vault.to_account_info().lamports.borrow();
@@ -862,8 +1119,16 @@ pub mod casino {
         }
 
         let p = &mut ctx.accounts.pending;
-        p.player = ctx.accounts.player.key(); p.amount = args.bet_amount; p.nonce = args.nonce; p.expiry_unix = args.expiry_unix; p.settled = false;
-        emit!(SlotsLocked { player: p.player, amount: p.amount, nonce: p.nonce });
+        p.player = ctx.accounts.player.key();
+        p.amount = args.bet_amount;
+        p.nonce = args.nonce;
+        p.expiry_unix = args.expiry_unix;
+        p.settled = false;
+        emit!(SlotsLocked {
+            player: p.player,
+            amount: p.amount,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 
@@ -873,20 +1138,36 @@ pub mod casino {
 
         let clock = Clock::get()?;
         require!(clock.unix_timestamp <= p.expiry_unix, CasinoErr::Expired);
-        require_ed25519_present(&ctx.accounts.sysvar_instructions.to_account_info(), args.ed25519_instr_index)?;
+        require_ed25519_present(
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            args.ed25519_instr_index,
+        )?;
 
         require!(args.payout <= MAX_PAYOUT_LAMPORTS, CasinoErr::BadPayout);
         if args.payout > 0 {
             let bump_v = ctx.bumps.house_vault;
-            let ix = system_instruction::transfer(&ctx.accounts.house_vault.key(), &ctx.accounts.user_vault.key(), args.payout);
-            invoke_signed(&ix, &[
-                ctx.accounts.house_vault.to_account_info(),
-                ctx.accounts.user_vault.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ], &[&[b"vault", &[bump_v]]])?;
+            let ix = system_instruction::transfer(
+                &ctx.accounts.house_vault.key(),
+                &ctx.accounts.user_vault.key(),
+                args.payout,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.house_vault.to_account_info(),
+                    ctx.accounts.user_vault.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[&[b"vault", &[bump_v]]],
+            )?;
         }
         p.settled = true;
-        emit!(SlotsResolved { player: p.player, payout: args.payout, checksum: args.checksum, nonce: p.nonce });
+        emit!(SlotsResolved {
+            player: p.player,
+            payout: args.payout,
+            checksum: args.checksum,
+            nonce: p.nonce,
+        });
         Ok(())
     }
 }
